@@ -4,26 +4,16 @@ const COLAB_URL = process.env.COLAB_CLOUDFLARED_URL || "http://localhost:5000";
 
 export async function sendMessageToColab(
   messages: Message[],
-  workspaceFiles?: { path: string; content: string }[]
+  workspaceFiles?: { path: string; content: string }[],
+  colabUrl?: string,
+  modelName?: string
 ): Promise<ChatResponse> {
-  const systemPrompt = `You are an expert AI coding assistant integrated into a vibe coding IDE. You can read and write code automatically.
+  const baseUrl = (colabUrl || COLAB_URL).replace(/\/+$/, "");
+  const model = modelName || "colab-model";
 
-When responding:
-1. Provide helpful explanations in natural language
-2. When code changes are needed, use the following JSON format for actions:
-
-For creating a new file:
-{"actions": [{"type": "create_file", "filePath": "path/to/file.ext", "content": "full file content"}]}
-
-For editing an existing file (using search and replace):
-{"actions": [{"type": "edit_file", "filePath": "path/to/file.ext", "searchReplace": [{"search": "code to find", "replace": "code to replace with"}]}]}
-
-For deleting a file:
-{"actions": [{"type": "delete_file", "filePath": "path/to/file.ext"}]}
-
-You can combine multiple actions in one response. Always wrap actions in a JSON code block with the language set to "json-actions".
-
-Be concise and helpful. Write production-quality code.`;
+  const systemPrompt = `You are an expert AI coding assistant. When creating/editing files, output ONLY valid JSON:
+{"actions":[{"type":"create_file","filePath":"path.ext","content":"file content"}]}
+Valid JSON only. Proper quotes, colons, and brackets.`;
 
   const formattedMessages = [
     { role: "system", content: systemPrompt },
@@ -44,22 +34,22 @@ Be concise and helpful. Write production-quality code.`;
   }
 
   try {
-    const response = await fetch(`${COLAB_URL}/v1/chat/completions`, {
+    const response = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: "colab-model",
+        model,
         messages: formattedMessages,
         max_tokens: 4096,
         temperature: 0.7,
       }),
+      redirect: "follow",
       signal: AbortSignal.timeout(60000),
     });
 
     if (!response.ok) {
-      throw new Error(`Colab API error: ${response.status}`);
+      const errorBody = await response.text();
+      throw new Error(`Colab API error: ${response.status} - ${errorBody}`);
     }
 
     const data = await response.json();
@@ -68,14 +58,10 @@ Be concise and helpful. Write production-quality code.`;
     const actions = extractActions(content);
     const cleanMessage = removeActionBlocks(content);
 
-    return {
-      message: cleanMessage,
-      actions,
-    };
+    return { message: cleanMessage, actions };
   } catch (error) {
-    console.error("Error calling Colab model:", error);
     return {
-      message: `Error connecting to model. Make sure your Cloudflared tunnel is running and the URL is configured correctly.\n\nDetails: ${error instanceof Error ? error.message : "Unknown error"}`,
+      message: `Error connecting to model.\n\nDetails: ${error instanceof Error ? error.message : "Unknown error"}`,
       actions: [],
     };
   }
@@ -92,24 +78,9 @@ export async function streamChatResponse(
   const model = modelName || "colab-model";
   const fullUrl = `${baseUrl}/v1/chat/completions`;
 
-  console.log("[Colab Client] Fetching:", fullUrl, "Model:", model);
-
-  const systemPrompt = `You are an expert AI coding assistant integrated into a vibe coding IDE. You can read and write code automatically.
-
-When responding:
-1. Provide helpful explanations in natural language
-2. When code changes are needed, use the following JSON format for actions:
-
-For creating a new file:
-{"actions": [{"type": "create_file", "filePath": "path/to/file.ext", "content": "full file content"}]}
-
-For editing an existing file:
-{"actions": [{"type": "edit_file", "filePath": "path/to/file.ext", "searchReplace": [{"search": "code to find", "replace": "code to replace with"}]}]}
-
-For deleting a file:
-{"actions": [{"type": "delete_file", "filePath": "path/to/file.ext"}]}
-
-Always wrap actions in a JSON code block with the language set to "json-actions".`;
+  const systemPrompt = `You are an expert AI coding assistant. When creating/editing files, output ONLY valid JSON:
+{"actions":[{"type":"create_file","filePath":"path.ext","content":"file content"}]}
+Valid JSON only. Proper quotes, colons, and brackets.`;
 
   const formattedMessages = [
     { role: "system", content: systemPrompt },
@@ -119,12 +90,20 @@ Always wrap actions in a JSON code block with the language set to "json-actions"
     })),
   ];
 
+  if (workspaceFiles && workspaceFiles.length > 0) {
+    const filesContext = workspaceFiles
+      .map((f) => `File: ${f.path}\n\`\`\`\n${f.content}\n\`\`\``)
+      .join("\n\n");
+    formattedMessages.push({
+      role: "system",
+      content: `Current workspace files:\n${filesContext}`,
+    });
+  }
+
   try {
     const response = await fetch(fullUrl, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model,
         messages: formattedMessages,
@@ -138,14 +117,11 @@ Always wrap actions in a JSON code block with the language set to "json-actions"
 
     if (!response.ok) {
       const errorBody = await response.text();
-      console.error("[Colab Client] Error response:", response.status, errorBody);
       throw new Error(`Colab API error: ${response.status} - ${errorBody}`);
     }
 
     const reader = response.body?.getReader();
-    if (!reader) {
-      throw new Error("No response body");
-    }
+    if (!reader) throw new Error("No response body");
 
     const decoder = new TextDecoder();
     let fullContent = "";
@@ -161,7 +137,6 @@ Always wrap actions in a JSON code block with the language set to "json-actions"
         if (line.startsWith("data: ")) {
           const data = line.slice(6).trim();
           if (data === "[DONE]") break;
-
           try {
             const parsed = JSON.parse(data);
             const content = parsed.choices?.[0]?.delta?.content || "";
@@ -169,18 +144,15 @@ Always wrap actions in a JSON code block with the language set to "json-actions"
               fullContent += content;
               onChunk(content);
             }
-          } catch {
-            // Skip malformed JSON
-          }
+          } catch {}
         }
       }
     }
 
     return extractActions(fullContent);
   } catch (error) {
-    console.error("Error streaming from Colab model:", error);
     onChunk(
-      `\n\nError connecting to model. Make sure your Cloudflared tunnel is running.\n\nDetails: ${error instanceof Error ? error.message : "Unknown error"}`
+      `\n\nError: ${error instanceof Error ? error.message : "Unknown error"}`
     );
     return [];
   }
@@ -188,23 +160,123 @@ Always wrap actions in a JSON code block with the language set to "json-actions"
 
 function extractActions(content: string): CodeAction[] {
   const actions: CodeAction[] = [];
-  const jsonBlockRegex = /```json-actions\n([\s\S]*?)```/g;
-  let match;
 
-  while ((match = jsonBlockRegex.exec(content)) !== null) {
-    try {
-      const parsed = JSON.parse(match[1].trim());
-      if (parsed.actions && Array.isArray(parsed.actions)) {
-        actions.push(...parsed.actions);
-      }
-    } catch {
-      // Skip malformed JSON
+  // 1. Try standard code blocks
+  const codeBlockRegex = /```(?:json-actions|json)?\s*([\s\S]*?)```/g;
+  let match;
+  while ((match = codeBlockRegex.exec(content)) !== null) {
+    const result = parseAndFixJson(match[1]);
+    if (result && result.actions) {
+      const actionList = Array.isArray(result.actions) ? result.actions : [result.actions];
+      actions.push(...actionList.map(normalizeAction));
     }
+  }
+
+  if (actions.length > 0) return actions;
+
+  // 2. Try finding JSON in the full text (no code blocks)
+  const fullTextResult = parseAndFixJson(content);
+  if (fullTextResult && fullTextResult.actions) {
+    const actionList = Array.isArray(fullTextResult.actions) ? fullTextResult.actions : [fullTextResult.actions];
+    actions.push(...actionList.map(normalizeAction));
+  }
+
+  if (actions.length > 0) return actions;
+
+  // 3. Regex fallback: extract create_file actions from raw text
+  // Looks for patterns like "filePath": "..." and "content": "..."
+  const filePathMatch = content.match(/"filePath"\s*:\s*"([^"]+)"/);
+  const contentMatch = content.match(/"content"\s*:\s*"([\s\S]*?)"/);
+
+  if (filePathMatch) {
+    actions.push({
+      type: "create_file",
+      filePath: filePathMatch[1],
+      content: contentMatch ? unescapeJsonString(contentMatch[1]) : "",
+    });
   }
 
   return actions;
 }
 
+function parseAndFixJson(str: string): any {
+  try {
+    return JSON.parse(str.trim());
+  } catch {
+    // Fix common model JSON issues
+    let fixed = str.trim();
+
+    // Fix missing opening brace
+    if (!fixed.startsWith("{")) fixed = "{" + fixed;
+
+    // Fix "actions": { ... } -> "actions": [ { ... } ]
+    fixed = fixed.replace(/"actions"\s*:\s*\{([\s\S]*?)\}\s*(,?\s*\})/g, (m, inner, trailing) => {
+      return `"actions": [{${inner}}]${trailing}`;
+    });
+
+    // Fix missing quotes before colons: "key" value -> "key": "value"
+    fixed = fixed.replace(/"([^"]+)"\s+([^\s,}\]:]+)/g, '"$1": "$2"');
+
+    // Fix broken filePath: "filePath":index.html" -> "filePath": "index.html"
+    fixed = fixed.replace(/"filePath"\s*:\s*([^"\s,}]+)"/g, '"filePath": "$1"');
+
+    // Fix unclosed strings in content by finding the last valid quote
+    fixed = fixUnclosedStrings(fixed);
+
+    // Ensure proper closing
+    const openBraces = (fixed.match(/{/g) || []).length;
+    const closeBraces = (fixed.match(/}/g) || []).length;
+    for (let i = 0; i < openBraces - closeBraces; i++) {
+      fixed += "}";
+    }
+
+    try {
+      return JSON.parse(fixed);
+    } catch {
+      // Last resort: try eval (safe in Node.js server context for this use case)
+      try {
+        return JSON.parse(fixed.replace(/,\s*([\]}])/g, "$1"));
+      } catch {
+        return null;
+      }
+    }
+  }
+}
+
+function fixUnclosedStrings(str: string): string {
+  // Find "content" key and fix its value
+  const contentRegex = /"content"\s*:\s*"([\s\S]*?)$/;
+  const match = str.match(contentRegex);
+  if (match) {
+    let value = match[1];
+    // Remove trailing broken HTML tags that break JSON
+    if (value.endsWith("\\</body>\\</html")) {
+      value += "\"></html>";
+    } else if (value.endsWith("</html")) {
+      value += "\">";
+    } else if (!value.endsWith('"')) {
+      value += '"';
+    }
+    str = str.substring(0, match.index!) + `"content": ${JSON.stringify(value)}`;
+  }
+  return str;
+}
+
+function normalizeAction(action: any): CodeAction {
+  return {
+    type: action.type || "create_file",
+    filePath: action.filePath || "unknown",
+    content: action.content,
+    searchReplace: action.searchReplace,
+  };
+}
+
+function unescapeJsonString(str: string): string {
+  return str.replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+}
+
 function removeActionBlocks(content: string): string {
-  return content.replace(/```json-actions\n[\s\S]*?```/g, "").trim();
+  let cleaned = content.replace(/```(?:json-actions|json)?\s*[\s\S]*?```/g, "").trim();
+  cleaned = cleaned.replace(/\{[\s]*["']actions["'][\s]*:[\s]*[\s\S]*?\}\s*\}/g, "").trim();
+  return cleaned;
 }
